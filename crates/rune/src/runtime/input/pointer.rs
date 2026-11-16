@@ -502,13 +502,32 @@ impl<S: 'static> Runtime<S> {
             .map(|(_, n)| n.id)
     }
 
+    /// The vertical viewport a wheel's `dy` at (x, y) scrolls: the innermost there that can
+    /// still move that way, as Chromium starts a wheel's scroll on the nearest scroller with
+    /// room in its direction. One at its end passes the wheel to the one around it, so a short
+    /// region inside a page never traps the wheel.
+    pub(super) fn wheel_target(&self, x: f32, y: f32, dy: f32) -> Option<NodeId> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(i, n)| n.scroll.is_some() && n.scroll_axes.has(false) && !self.subtree_exiting(*i) && self.allowed(*i))
+            .filter(|(_, n)| self.scrolls.get(&n.id).is_some_and(|st| {
+                // A wheel's ease counts from where it heads.
+                let at = st.mode.wheel().map_or(st.offset, |c| c.target());
+                if dy > 0.0 { at > 0.0 } else { at < st.max }
+            }))
+            .find(|(i, _)| self.node_contains(*i, x, y))
+            .map(|(_, n)| n.id)
+    }
+
     /// Wheel or trackpad delta in points (positive `dy` moves content down, like a browser's
     /// negative deltaY). Applied 1:1: the platform supplies its own momentum phases.
     pub fn wheel(&mut self, x: f32, y: f32, dy: f32) {
         self.release_hover_hold();
         self.drop_scroll_holds();
         self.dismiss_help();
-        let Some(id) = self.scroll_at(x, y) else { return };
+        let Some(id) = self.wheel_target(x, y, dy) else { return };
         let stick = self.node_index.get(&id).and_then(|&i| self.nodes[i].scroll).is_some_and(|s| s.stick_bottom);
         if let Some(st) = self.scrolls.get_mut(&id) {
             let before = st.offset;
@@ -517,6 +536,41 @@ impl<S: 'static> Runtime<S> {
             st.land(stick);
             log_event!(self, "wheel {dy:.1}");
             if st.offset != before { self.scroll_cancels_press(id); }
+        }
+    }
+
+    /// Whether whole notches of a mouse wheel ease rather than jump: the app hasn't turned it off
+    /// (`Self::set_wheel_glide`), and motion isn't reduced or settled.
+    pub(super) fn wheel_glides(&self) -> bool { self.wheel_glide && !self.reduced_motion && !self.settled }
+
+    /// Whether whole notches of a mouse wheel that no [`El::on_wheel`] handler takes ease to
+    /// where they send a scroll viewport, as the platform's browsers do (on by default; a notch
+    /// jumps with reduced motion). Off, every notch moves the offset at once. A handler hears
+    /// the notch as it arrives either way ([`crate::WheelEvent::notch`]) and moves what it moves.
+    pub fn set_wheel_glide(&mut self, on: bool) { self.wheel_glide = on; }
+
+    /// Whole notches of a mouse wheel, `dy` points (positive moves content down): the offset
+    /// eases to where they send it as Chromium's does (`runtime/scroll/wheel.rs`), a notch that
+    /// comes while it moves sending it on from where it is. With reduced motion, it jumps.
+    pub(super) fn wheel_notch(&mut self, x: f32, y: f32, dy: f32) {
+        if !self.wheel_glides() {
+            self.wheel(x, y, dy);
+            return;
+        }
+        self.release_hover_hold();
+        self.drop_scroll_holds();
+        self.dismiss_help();
+        let Some(id) = self.wheel_target(x, y, dy) else { return };
+        // The ease's time follows the distance in device pixels, as Chromium measures it.
+        let scale = f64::from(self.env.scale * self.zoom());
+        let Some(st) = self.scrolls.get_mut(&id) else { return };
+        let mut curve = st.mode.wheel().unwrap_or_else(|| scroll_wheel::WheelCurve::new(st.offset, st.offset, scale));
+        let to = (curve.target() - f64::from(dy)).clamp(0.0, st.max);
+        if curve.retarget(to, scale) {
+            st.mode = st.mode.to_wheel(curve);
+            st.moved();
+            log_event!(self, "wheel-notch {dy:.1}");
+            self.scroll_cancels_press(id);
         }
     }
 
