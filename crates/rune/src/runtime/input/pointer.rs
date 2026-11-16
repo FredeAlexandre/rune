@@ -528,15 +528,21 @@ impl<S: 'static> Runtime<S> {
         self.drop_scroll_holds();
         self.dismiss_help();
         let Some(id) = self.wheel_target(x, y, dy) else { return };
+        self.wheel_by(id, dy);
+    }
+
+    /// Moves viewport `id` by `dy` points at once; true when it moved.
+    fn wheel_by(&mut self, id: NodeId, dy: f32) -> bool {
         let stick = self.node_index.get(&id).and_then(|&i| self.nodes[i].scroll).is_some_and(|s| s.stick_bottom);
-        if let Some(st) = self.scrolls.get_mut(&id) {
-            let before = st.offset;
-            st.offset = (st.offset - f64::from(dy)).clamp(0.0, st.max);
-            st.moved();
-            st.land(stick);
-            log_event!(self, "wheel {dy:.1}");
-            if st.offset != before { self.scroll_cancels_press(id); }
-        }
+        let Some(st) = self.scrolls.get_mut(&id) else { return false };
+        let before = st.offset;
+        st.offset = (st.offset - f64::from(dy)).clamp(0.0, st.max);
+        st.moved();
+        st.land(stick);
+        log_event!(self, "wheel {dy:.1}");
+        let moved = st.offset != before;
+        if moved { self.scroll_cancels_press(id); }
+        moved
     }
 
     /// Whether whole notches of a mouse wheel ease rather than jump: the app hasn't turned it off
@@ -551,28 +557,42 @@ impl<S: 'static> Runtime<S> {
 
     /// Whole notches of a mouse wheel, `dy` points (positive moves content down): the offset
     /// eases to where they send it as Chromium's does (`runtime/scroll/wheel.rs`), a notch that
-    /// comes while it moves sending it on from where it is. With reduced motion, it jumps.
+    /// comes while it moves sending it on from where it is. With reduced motion, it jumps. A run
+    /// of notches stays with the viewport it began on (`scroll_wheel::WheelLatch`).
     pub(super) fn wheel_notch(&mut self, x: f32, y: f32, dy: f32) {
-        if !self.wheel_glides() {
-            self.wheel(x, y, dy);
-            return;
-        }
         self.release_hover_hold();
         self.drop_scroll_holds();
         self.dismiss_help();
-        let Some(id) = self.wheel_target(x, y, dy) else { return };
+        let now = self.now_clock();
+        let latched = self.wheel_latch.filter(|l| {
+            l.holds(now, x, y, dy)
+                && self.node_index.get(&l.id).is_some_and(|&i| self.nodes[i].scroll.is_some() && !self.subtree_exiting(i) && self.allowed(i))
+        });
+        let Some(id) = latched.map(|l| l.id).or_else(|| self.wheel_target(x, y, dy)) else {
+            self.wheel_latch = None;
+            return;
+        };
+        let moved = if self.wheel_glides() { self.wheel_ease(id, dy) } else { self.wheel_by(id, dy) };
+        self.wheel_latch = Some(match latched {
+            Some(mut l) => { l.notch(now); l }
+            None => scroll_wheel::WheelLatch::new(id, now, x, y, dy, moved),
+        });
+    }
+
+    /// Sends viewport `id`'s ease `dy` points on; true when it moves.
+    fn wheel_ease(&mut self, id: NodeId, dy: f32) -> bool {
         // The ease's time follows the distance in device pixels, as Chromium measures it.
         let scale = f64::from(self.env.scale * self.zoom());
-        let Some(st) = self.scrolls.get_mut(&id) else { return };
+        let Some(st) = self.scrolls.get_mut(&id) else { return false };
         let mut curve = st.mode.wheel().unwrap_or_else(|| scroll_wheel::WheelCurve::new(st.offset, st.offset, scale));
         curve.follow(st.offset);
         let to = (curve.target() - f64::from(dy)).clamp(0.0, st.max);
-        if curve.retarget(to, scale) {
-            st.mode = st.mode.to_wheel(curve);
-            st.moved();
-            log_event!(self, "wheel-notch {dy:.1}");
-            self.scroll_cancels_press(id);
-        }
+        if !curve.retarget(to, scale) { return false; }
+        st.mode = st.mode.to_wheel(curve);
+        st.moved();
+        log_event!(self, "wheel-notch {dy:.1}");
+        self.scroll_cancels_press(id);
+        true
     }
 
     /// Releases a scroll with `velocity` (points per second, positive moves content down);

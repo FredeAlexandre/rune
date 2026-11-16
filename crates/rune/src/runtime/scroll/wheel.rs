@@ -127,6 +127,43 @@ impl WheelCurve {
 
 }
 
+/// Seconds since the last notch for which a run of notches stays with the viewport it began on
+/// (`kDefaultMouseWheelLatchingTransaction`), and how far in points the pointer may stray from
+/// where the run began (`kWheelLatchingSlopRegion`).
+const LATCH_IDLE: f64 = 0.5;
+const LATCH_SLOP: f32 = 10.0;
+
+/// The viewport a run of notches scrolls, as Chromium keeps a mouse wheel's scroll on the
+/// scroller it began on until the wheel rests (`content/browser/renderer_host/input/
+/// mouse_wheel_phase_handler.cc`, and cc scrolls only the latched scroller): a region that
+/// reaches its end mid-run takes the rest of the run, the one around it moves from the next
+/// run on, and a region that the page carries under the pointer mid-run doesn't catch it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WheelLatch {
+    pub(crate) id: super::NodeId,
+    at: f64,
+    x: f32,
+    y: f32,
+    up: bool,
+    /// Its first notch moved the viewport: only a run whose first notch moved nothing ends when
+    /// the wheel turns the other way (`ShouldBreakLatchingDueToDirectionChange`).
+    moved: bool,
+}
+
+impl WheelLatch {
+    pub(crate) fn new(id: super::NodeId, now: f64, x: f32, y: f32, dy: f32, moved: bool) -> Self {
+        WheelLatch { id, at: now, x, y, up: dy > 0.0, moved }
+    }
+
+    /// Whether a notch `dy` at (x, y) at `now` belongs to this run.
+    pub(crate) fn holds(&self, now: f64, x: f32, y: f32, dy: f32) -> bool {
+        now - self.at <= LATCH_IDLE && (x - self.x).hypot(y - self.y) < LATCH_SLOP && (self.moved || (dy > 0.0) == self.up)
+    }
+
+    /// Another notch of the run came at `now`.
+    pub(crate) fn notch(&mut self, now: f64) { self.at = now; }
+}
+
 /// `offset` points on the nearest whole device pixel, `scale` of them to a point.
 pub(crate) fn device_pixel(offset: f64, scale: f64) -> f64 {
     if scale > 0.0 { (offset * scale).round() / scale } else { offset }

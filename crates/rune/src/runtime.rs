@@ -628,6 +628,8 @@ pub struct Runtime<S: 'static> {
     wheel_lock: scroll_x::WheelLock,
     /// Whole notches of a mouse wheel ease where the platform's browsers do (`Runtime::set_wheel_glide`).
     wheel_glide: bool,
+    /// The viewport the current run of wheel notches stays with (`runtime/scroll/wheel.rs`).
+    wheel_latch: Option<scroll_wheel::WheelLatch>,
     /// The finger that is down and the viewport a touch holds (`runtime/input/touch.rs`).
     touch: touch_input::Touch,
     grows: HashMap<NodeId, GrowTrack>,
@@ -1023,6 +1025,7 @@ impl<S: 'static> Runtime<S> {
             scrolls: HashMap::default(),
             wheel_lock: Default::default(),
             wheel_glide: true,
+            wheel_latch: None,
             touch: Default::default(),
             grows: HashMap::default(),
             stacks: HashMap::default(),
